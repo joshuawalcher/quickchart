@@ -1,28 +1,64 @@
 const path = require('path');
 
-const { CanvasRenderService } = require('chartjs-node-canvas');
-const chartDataLabels = require('chartjs-plugin-datalabels');
 const express = require('express');
 const expressNunjucks = require('express-nunjucks');
-const qr = require('qr-image');
+const qs = require('qs');
+const rateLimit = require('express-rate-limit');
 const text2png = require('text2png');
-const winston = require('winston');
-const { NodeVM } = require('vm2');
 
-const { addBackgroundColors } = require('./charts');
-
-const logger = new (winston.Logger)({
-  transports: [
-    new (winston.transports.Console)({ timestamp: true, colorize: true }),
-  ],
-});
+const apiKeys = require('./api_keys');
+const packageJson = require('./package.json');
+const telemetry = require('./telemetry');
+const { getPdfBufferFromPng, getPdfBufferWithText } = require('./lib/pdf');
+const { logger } = require('./logging');
+const { renderChart } = require('./lib/charts');
+const { renderQr, DEFAULT_QR_SIZE } = require('./lib/qr');
 
 const app = express();
 
-const isDev = app.get('env') === 'development';
+const isDev = app.get('env') === 'development' || app.get('env') === 'test';
 
+app.set('query parser', str =>
+  qs.parse(str, {
+    decode(s) {
+      // Default express implementation replaces '+' with space. We don't want
+      // that. See https://github.com/expressjs/express/issues/3453
+      return decodeURIComponent(s);
+    },
+  }),
+);
 app.set('views', `${__dirname}/templates`);
-app.use(express.static('public'));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+app.use(express.urlencoded());
+
+if (process.env.RATE_LIMIT_PER_MIN) {
+  const limitMax = parseInt(process.env.RATE_LIMIT_PER_MIN, 10);
+  logger.info('Enabling rate limit:', limitMax);
+
+  const limiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: limitMax,
+    message:
+      'Please slow down your requests! This is a shared public endpoint. Email contact@quickchart.io for rate limit exceptions or to purchase a commercial license.',
+    onLimitReached: () => {
+      logger.info('User hit rate limit!');
+    },
+    skip: req => {
+      // If user has a special key, bypass rate limiting.
+      const ret = apiKeys.requestHasValidKey(req);
+      if (ret) {
+        apiKeys.countRequest(req);
+      }
+      return ret;
+    },
+    keyGenerator: req => {
+      return req.headers['x-forwarded-for'] || req.ip;
+    },
+  });
+  app.use('/chart', limiter);
+  app.use('/qr', limiter);
+}
 
 expressNunjucks(app, {
   watch: isDev,
@@ -33,164 +69,271 @@ app.get('/', (req, res) => {
   res.render('index');
 });
 
+app.get('/pricing', (req, res) => {
+  res.render('pricing');
+});
+
+app.get('/documentation', (req, res) => {
+  res.render('docs');
+});
+
 app.get('/robots.txt', (req, res) => {
   res.sendFile(path.join(__dirname, './templates/robots.txt'));
+});
+
+app.post('/telemetry', (req, res) => {
+  const chartCount = parseInt(req.body.chartCount, 10);
+  const qrCount = parseInt(req.body.qrCount, 10);
+  const pid = req.body.pid;
+
+  if (chartCount && !isNaN(chartCount)) {
+    telemetry.receive(pid, 'chartCount', chartCount);
+  }
+  if (qrCount && !isNaN(qrCount)) {
+    telemetry.receive(pid, 'qrCount', qrCount);
+  }
+
+  res.send({ success: true });
+});
+
+app.get('/payment-success', (req, res) => {
+  res.render('payment_success');
+});
+
+app.get('/api/account/:key', (req, res) => {
+  const key = req.params.key;
+  res.send({
+    isValid: apiKeys.isValidKey(key),
+    numRecentRequests: apiKeys.getNumRecentRequests(key),
+  });
 });
 
 function failPng(res, msg) {
   res.writeHead(500, {
     'Content-Type': 'image/png',
   });
-  res.end(text2png(`Chart Error: ${msg}`));
+  res.end(
+    text2png(`Chart Error: ${msg}`, {
+      padding: 10,
+      backgroundColor: '#fff',
+    }),
+  );
 }
 
-app.get('/chart', (req, res) => {
-  if (!req.query.c) {
-    failPng(res, 'You are missing variable `c`');
+async function failPdf(res, msg) {
+  const buf = await getPdfBufferWithText(msg);
+  res.writeHead(500, {
+    'Content-Type': 'application/pdf',
+  });
+  res.end(buf);
+}
+
+function doRenderChart(req, res, opts) {
+  opts.failFn = failPng;
+  opts.onRenderHandler = buf => {
+    res.writeHead(200, {
+      'Content-Type': 'image/png',
+      'Content-Length': buf.length,
+
+      // 1 week cache
+      'Cache-Control': 'public, max-age=604800',
+    });
+    res.end(buf);
+  };
+  doRender(req, res, opts);
+}
+
+async function doRenderPdf(req, res, opts) {
+  opts.failFn = failPdf;
+  opts.onRenderHandler = async buf => {
+    const pdfBuf = await getPdfBufferFromPng(buf);
+
+    res.writeHead(200, {
+      'Content-Type': 'application/pdf',
+      'Content-Length': pdfBuf.length,
+
+      // 1 week cache
+      'Cache-Control': 'public, max-age=604800',
+    });
+    res.end(pdfBuf);
+  };
+  doRender(req, res, opts);
+}
+
+function doRender(req, res, opts) {
+  if (!opts.chart) {
+    opts.failFn(res, 'You are missing variable `c` or `chart`');
     return;
   }
 
   let height = 300;
   let width = 500;
-  if (req.query.h || req.query.height) {
-    const heightNum = parseInt(req.query.h || req.query.height, 10);
+  if (opts.height) {
+    const heightNum = parseInt(opts.height, 10);
     if (!Number.isNaN(heightNum)) {
       height = heightNum;
     }
   }
-  if (req.query.w || req.query.width) {
-    const widthNum = parseInt(req.query.w || req.query.width, 10);
+  if (opts.width) {
+    const widthNum = parseInt(opts.width, 10);
     if (!Number.isNaN(widthNum)) {
       width = widthNum;
     }
   }
 
-  let chart;
-  try {
-    const vm = new NodeVM();
+  // Choose retina resolution by default. This will cause images to be 2x size
+  // in absolute terms.
+  const devicePixelRatio = opts.devicePixelRatio || 2.0;
 
-    const untrustedInput = decodeURIComponent(req.query.c);
-    if (untrustedInput.match(/(for|while)\(/gi)) {
-      failPng(res, 'Input is not allowed');
+  let untrustedInput = opts.chart;
+  if (opts.encoding === 'base64') {
+    try {
+      untrustedInput = Buffer.from(opts.chart, 'base64').toString('utf8');
+    } catch (err) {
+      logger.warn('base64 malformed', err);
+      opts.failFn(res, err);
       return;
     }
-    chart = vm.run(`module.exports = ${untrustedInput}`);
-  } catch (err) {
-    logger.error('Input Error', err);
-    failPng(res, 'Invalid input');
+  }
+
+  const backgroundColor = opts.backgroundColor || 'transparent';
+
+  renderChart(width, height, backgroundColor, devicePixelRatio, untrustedInput)
+    .then(opts.onRenderHandler)
+    .catch(err => {
+      logger.warn('Chart error', err);
+      opts.failFn(res, err);
+    });
+}
+
+app.get('/chart', (req, res) => {
+  const opts = {
+    chart: req.query.c || req.query.chart,
+    height: req.query.h || req.query.height,
+    width: req.query.w || req.query.width,
+    backgroundColor: req.query.backgroundColor || req.query.bkg,
+    devicePixelRatio: req.query.devicePixelRatio,
+    encoding: req.query.encoding || 'url',
+  };
+
+  const outputFormat = (req.query.f || req.query.format || '').toLowerCase();
+
+  if (outputFormat === 'pdf') {
+    doRenderPdf(req, res, opts);
+  } else {
+    doRenderChart(req, res, opts);
+  }
+
+  telemetry.count('chartCount');
+});
+
+app.post('/chart', (req, res) => {
+  const opts = {
+    chart: req.body.c || req.body.chart,
+    height: req.body.h || req.body.height,
+    width: req.body.w || req.body.width,
+    backgroundColor: req.body.backgroundColor || req.body.bkg,
+    devicePixelRatio: req.body.devicePixelRatio,
+    encoding: req.body.encoding || 'url',
+  };
+  const outputFormat = (req.body.f || req.body.format || '').toLowerCase();
+
+  if (outputFormat === 'pdf') {
+    doRenderPdf(req, res, opts);
+  } else {
+    doRenderChart(req, res, opts);
+  }
+
+  telemetry.count('chartCount');
+});
+
+app.get('/qr', (req, res) => {
+  if (!req.query.text) {
+    failPng(res, 'You are missing variable `text`');
     return;
   }
 
-  if (chart.type === 'donut') {
-    // Fix spelling...
-    chart.type = 'doughnut';
+  let format = 'png';
+  if (req.query.format === 'svg') {
+    format = 'svg';
   }
 
-  // Implement default options
-  chart.options = chart.options || {};
-  chart.options.devicePixelRatio = 2.0;
-  if (chart.type === 'bar' || chart.type === 'line' || chart.type === 'scatter' || chart.type === 'bubble') {
-    if (!chart.options.scales) {
-      // TODO(ian): Merge default options with provided options
-      chart.options.scales = {
-        yAxes: [{
-          ticks: {
-            beginAtZero: true,
-          },
-        }],
-      };
-    }
-    addBackgroundColors(chart);
-  } else if (chart.type === 'radar') {
-    addBackgroundColors(chart);
-  } else if (chart.type === 'pie' || chart.type === 'doughnut') {
-    addBackgroundColors(chart);
-  } else if (chart.type === 'scatter') {
-    addBackgroundColors(chart);
-  } else if (chart.type === 'bubble') {
-    addBackgroundColors(chart);
-  }
+  const { mode } = req.query;
 
-  if (chart.type === 'line') {
-    chart.data.datasets.forEach((dataset) => {
-      const data = dataset;
-      // Make line charts straight lines by default.
-      data.lineTension = data.lineTension || 0;
-    });
-  }
+  const margin = typeof req.query.margin === 'undefined' ? 4 : parseInt(req.query.margin, 10);
+  const ecLevel = req.query.ecLevel || undefined;
+  const size = Math.min(3000, parseInt(req.query.size, 10)) || DEFAULT_QR_SIZE;
+  const darkColor = req.query.dark || '000';
+  const lightColor = req.query.light || 'fff';
 
-  chart.options.plugins = chart.options.plugins || {};
-  if (!chart.options.plugins.datalabels) {
-    chart.options.plugins.datalabels = {};
-    if (chart.type === 'pie' || chart.type === 'doughnut') {
-      chart.options.plugins.datalabels = {
-        display: true,
-      };
-    } else {
-      chart.options.plugins.datalabels = {
-        display: false,
-      };
-    }
-  }
-
-  logger.info('Chart:', JSON.stringify(chart));
-  chart.plugins = [chartDataLabels];
-
-  const canvasRenderService = new CanvasRenderService(width, height, (ChartJS) => {
-    const backgroundColor = req.query.backgroundColor || req.query.bkg;
-    if (backgroundColor) {
-      ChartJS.pluginService.register({
-        beforeDraw: (chartInstance) => {
-          const { ctx } = chartInstance.chart;
-          ctx.fillStyle = backgroundColor;
-          ctx.fillRect(0, 0, chartInstance.chart.width, chartInstance.chart.height);
-        },
-      });
-    }
-  });
-
+  let qrData;
   try {
-    canvasRenderService.renderToBuffer(chart).then((buf) => {
+    qrData = decodeURIComponent(req.query.text);
+  } catch (err) {
+    logger.warn('URI malformed', err);
+    failPng(res, 'URI malformed');
+    return;
+  }
+  const qrOpts = {
+    margin,
+    width: size,
+    errorCorrectionLevel: ecLevel,
+    color: {
+      dark: darkColor,
+      light: lightColor,
+    },
+  };
+
+  renderQr(format, mode, qrData, qrOpts)
+    .then(buf => {
       res.writeHead(200, {
-        'Content-Type': 'image/png',
+        'Content-Type': format === 'png' ? 'image/png' : 'image/svg+xml',
         'Content-Length': buf.length,
 
         // 1 week cache
         'Cache-Control': 'public, max-age=604800',
       });
       res.end(buf);
-    }).catch((err) => {
-      logger.error('Chart error', err);
-      failPng(res, 'Invalid chart options');
+    })
+    .catch(err => {
+      failPng(res, err);
     });
-  } catch (err) {
-    // canvasRenderService doesn't seem to be throwing errors correctly for
-    // certain chart errors.
-    logger.error('Render error', err);
-    failPng(res, 'Invalid chart options');
-  }
+
+  telemetry.count('qrCount');
 });
 
-app.get('/qr', (req, res) => {
-  let format = 'png';
-  if (req.query.format === 'svg') {
-    format = 'svg';
-  }
-  const buf = qr.imageSync(decodeURIComponent(req.query.text), { type: format });
-  res.writeHead(200, {
-    'Content-Type': `image/${format}`,
-    'Content-Length': buf.length,
+app.get('/healthcheck', (req, res) => {
+  // A lightweight healthcheck endpoint.
+  res.send({ success: true, version: packageJson.version });
+});
 
-    // 1 week cache
-    'Cache-Control': 'public, max-age=604800',
-  });
-  res.end(buf);
+app.get('/healthcheck/chart', (req, res) => {
+  // A heavier healthcheck endpoint that redirects to a unique chart.
+  const labels = [...Array(5)].map(() => Math.random());
+  const data = [...Array(5)].map(() => Math.random());
+  const template = `
+{
+  type: 'bar',
+  data: {
+    labels: [${labels.join(',')}],
+    datasets: [{
+      data: [${data.join(',')}]
+    }]
+  }
+}
+`;
+  res.redirect(`/chart?c=${template}`);
 });
 
 const port = process.env.PORT || 3400;
 const server = app.listen(port);
-logger.info('NODE_ENV:', process.env.NODE_ENV);
-logger.info('Running on port', port);
+
+const timeout = parseInt(process.env.REQUEST_TIMEOUT_MS, 10) || 1000;
+server.setTimeout(timeout);
+logger.info(`Setting request timeout: ${timeout} ms`);
+
+logger.info(`NODE_ENV: ${process.env.NODE_ENV}`);
+logger.info(`Listening on port ${port}`);
 
 if (!isDev) {
   const gracefulShutdown = function gracefulShutdown() {
@@ -211,6 +354,10 @@ if (!isDev) {
 
   // listen for INT signal e.g. Ctrl-C
   process.on('SIGINT', gracefulShutdown);
+
+  process.on('SIGABRT', () => {
+    logger.info('Caught SIGABRT');
+  });
 }
 
 module.exports = app;
